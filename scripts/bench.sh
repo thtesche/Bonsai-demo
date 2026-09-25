@@ -14,6 +14,11 @@
 #   ./scripts/bench.sh --backend llama    # one backend only
 #   ./scripts/bench.sh --runs 5 --tokens 256
 #   ./scripts/bench.sh --port 8099        # if something already owns 8099
+#   ./scripts/bench.sh --url http://192.168.0.109:8080   # a server someone else started
+#
+# --url measures a server that is already running and does not start or stop anything, so it
+# is safe against a long-lived instance you did not launch (another machine, or a server in
+# production). It is the way to compare two models that are each served on their own port.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -27,6 +32,7 @@ RUNS=3
 MAX_TOKENS=256
 PORT=8099
 MLX_PORT=8081
+URL=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -34,7 +40,8 @@ while [ $# -gt 0 ]; do
         --runs)    RUNS="$2"; shift 2 ;;
         --tokens)  MAX_TOKENS="$2"; shift 2 ;;
         --port)    PORT="$2"; shift 2 ;;
-        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --url)     URL="$2"; shift 2 ;;
+        -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) err "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -43,6 +50,12 @@ case "$BACKEND" in
     llama|mlx|both) ;;
     *) err "--backend must be llama, mlx or both."; exit 1 ;;
 esac
+
+if [ -n "$URL" ] && [ "$BACKEND" = "mlx" ]; then
+    err "--url measures an OpenAI-compatible server, so it cannot be combined with --backend mlx."
+    err "  Use --backend llama (the default) to measure $URL."
+    exit 1
+fi
 
 if ! command -v python3 >/dev/null 2>&1; then
     err "python3 is required (used to read the API timings)."
@@ -193,10 +206,49 @@ median() {   # median of whitespace-separated numbers on stdin
         | awk '{a[NR]=$1} END{if(NR==0){print "0";exit} print (NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2}'
 }
 
+# ── Measure a server that is already answering on $1, and print the table ──
+# Shared by the self-started path and --url, so both produce the same numbers from the
+# same client and the same prompt.
+measure_url() {
+    _mu_base="$1"
+    _mu_label="${2:-llama.cpp}"
+
+    write_client
+    R=$(python3 "$TMP/client.py" "$_mu_base" "$MAX_TOKENS" "$RUNS" "$TMP/base_prompt.txt" single 2>"$TMP/run.log")
+    cat "$TMP/run.log" >&2
+    if [ -z "$R" ]; then
+        err "no result from $_mu_base; see the run log above"
+        return 1
+    fi
+    R_GEN=$(echo "$R" | cut -d' ' -f1)
+    R_PRE=$(echo "$R" | cut -d' ' -f2)
+    printf "  %-22s %10s %10s\n" "metric" "decode t/s" "prefill t/s"
+    printf "  %-22s %10s %10s\n" "----------------------" "----------" "----------"
+    printf "  %-22s %10s %10s\n" "$_mu_label" "$R_GEN" "$R_PRE"
+
+    F=$(python3 "$TMP/client.py" "$_mu_base" "$MAX_TOKENS" 1 "$TMP/base_prompt.txt" followup "$PAD" 2>/dev/null)
+    if [ -n "$F" ]; then
+        F_SECS=$(echo "$F" | cut -d' ' -f1)
+        F_TOK=$(echo "$F" | cut -d' ' -f2)
+        printf "  %-22s %10s %10s\n" "follow-up prefill" "${F_SECS}s" "${F_TOK} tok"
+    fi
+}
+
+# ── An already-running server, started by someone else or on another host ──
+bench_url() {
+    if ! curl -s --max-time 5 "$URL/health" >/dev/null 2>&1; then
+        err "$URL is not answering on /health"
+        return 1
+    fi
+    step "$URL (already running, left untouched)"
+    measure_url "$URL" "server"
+}
+
 # ── llama.cpp: through the real start script, so the numbers match what you would run ──
 bench_llama() {
     if curl -s --max-time 2 "http://localhost:$PORT/health" >/dev/null 2>&1; then
         warn "Something is already serving on port $PORT. Stop it, or pass --port."
+        warn "To measure a server you did not start, use --url http://localhost:$PORT"
         return 1
     fi
 
@@ -223,25 +275,7 @@ bench_llama() {
     fi
     sleep 5   # let the first request not race the weight load
 
-    write_client
-    R=$(python3 "$TMP/client.py" "http://localhost:$PORT" "$MAX_TOKENS" "$RUNS" "$TMP/base_prompt.txt" single 2>"$TMP/run.log")
-    cat "$TMP/run.log" >&2
-    if [ -z "$R" ]; then
-        err "no result; see the run log above"
-        return 1
-    fi
-    R_GEN=$(echo "$R" | cut -d' ' -f1)
-    R_PRE=$(echo "$R" | cut -d' ' -f2)
-    printf "  %-22s %10s %10s\n" "metric" "decode t/s" "prefill t/s"
-    printf "  %-22s %10s %10s\n" "----------------------" "----------" "----------"
-    printf "  %-22s %10s %10s\n" "llama.cpp" "$R_GEN" "$R_PRE"
-
-    F=$(python3 "$TMP/client.py" "http://localhost:$PORT" "$MAX_TOKENS" 1 "$TMP/base_prompt.txt" followup "$PAD" 2>/dev/null)
-    if [ -n "$F" ]; then
-        F_SECS=$(echo "$F" | cut -d' ' -f1)
-        F_TOK=$(echo "$F" | cut -d' ' -f2)
-        printf "  %-22s %10s %10s\n" "follow-up prefill" "${F_SECS}s" "${F_TOK} tok"
-    fi
+    measure_url "http://localhost:$PORT" "llama.cpp"
 
     kill "$LLAMA_PID" 2>/dev/null || true
     LLAMA_PID=""
@@ -321,15 +355,23 @@ $TURN2_FOLLOWUP"
 }
 
 echo ""
-echo "=== Token throughput on this machine ==="
-echo "  model: ${BONSAI_DISPLAY}   runs: $RUNS   decode length: $MAX_TOKENS tokens"
+if [ -n "$URL" ]; then
+    echo "=== Token throughput of $URL ==="
+else
+    echo "=== Token throughput on this machine ==="
+fi
+if [ -n "$URL" ]; then
+    echo "  runs: $RUNS   decode length: $MAX_TOKENS tokens"
+else
+    echo "  model: ${BONSAI_DISPLAY}   runs: $RUNS   decode length: $MAX_TOKENS tokens"
+fi
 echo "  thinking is off in both, so this measures the model, not the reasoning budget."
 echo ""
 
 case "$BACKEND" in
-    llama) bench_llama ;;
+    llama) if [ -n "$URL" ]; then bench_url; else bench_llama; fi ;;
     mlx)   bench_mlx ;;
-    both)  bench_llama; echo ""; bench_mlx ;;
+    both)  if [ -n "$URL" ]; then bench_url; else bench_llama; echo ""; bench_mlx; fi ;;
 esac
 
 echo ""
