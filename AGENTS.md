@@ -229,9 +229,12 @@ curl -s http://localhost:8080/props | python3 -m json.tool | head -30
 
 `bench.sh` starts and stops its own servers (on port 8099, so it will not disturb a server
 you already have on 8080) and refuses to run if that port is taken. It measures through the
-normal start scripts, so the numbers are the configuration you would actually get. Prefer it
-to quoting a figure from someone else's machine: 27B decode at 2 bit is memory-bandwidth
-bound, so two Macs running the identical file can differ by more than any flag will.
+normal start scripts, so the numbers are the configuration you would actually get. With
+`--url http://host:port` it instead measures a server that is already running and does not
+start, stop or signal anything, which is how you benchmark an instance on another machine or
+compare two models each on their own port. Prefer it to quoting a figure from someone else's
+machine: 27B decode at 2 bit is memory-bandwidth bound, so two Macs running the identical file
+can differ by more than any flag will.
 
 Tool calling: send an OpenAI `tools` array; expect `finish_reason: "tool_calls"`.
 Vision: send an `image_url` content part (data URI works). Both verified on both
