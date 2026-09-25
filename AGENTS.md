@@ -217,12 +217,21 @@ Reported with Bonsai 2 27B `PTQ1_0` and release `prism-b10685-7dffb15`:
 ## Quick verification commands
 
 ```bash
+# decode and prefill throughput on this machine, llama.cpp and MLX side by side
+./scripts/bench.sh
+
 # server capabilities and effective context/slots
 curl -s http://localhost:8080/props | python3 -m json.tool | head -30
 
 # timing any request: read the "timings" object in the response
 # (prompt_ms = encode+prefill, predicted_per_second = generation speed)
 ```
+
+`bench.sh` starts and stops its own servers (on port 8099, so it will not disturb a server
+you already have on 8080) and refuses to run if that port is taken. It measures through the
+normal start scripts, so the numbers are the configuration you would actually get. Prefer it
+to quoting a figure from someone else's machine: 27B decode at 2 bit is memory-bandwidth
+bound, so two Macs running the identical file can differ by more than any flag will.
 
 Tool calling: send an OpenAI `tools` array; expect `finish_reason: "tool_calls"`.
 Vision: send an `image_url` content part (data URI works). Both verified on both
