@@ -15,10 +15,16 @@
 #   ./scripts/bench.sh --runs 5 --tokens 256
 #   ./scripts/bench.sh --port 8099        # if something already owns 8099
 #   ./scripts/bench.sh --url http://192.168.0.109:8080   # a server someone else started
+#   ./scripts/bench.sh --url http://localhost:8091 --model /path/to/pack   # mlx-vlm server
 #
 # --url measures a server that is already running and does not start or stop anything, so it
 # is safe against a long-lived instance you did not launch (another machine, or a server in
 # production). It is the way to compare two models that are each served on their own port.
+#
+# --model is only needed for a server that resolves the "model" field per request. llama-server
+# ignores it and serves the model it was started with, so the default "local" is fine there.
+# mlx_vlm.server does not: it reads the field as a Hugging Face id and 404s on "local", so pass
+# the model path it was started with.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -33,6 +39,7 @@ MAX_TOKENS=256
 PORT=8099
 MLX_PORT=8081
 URL=""
+MODEL="local"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -41,7 +48,8 @@ while [ $# -gt 0 ]; do
         --tokens)  MAX_TOKENS="$2"; shift 2 ;;
         --port)    PORT="$2"; shift 2 ;;
         --url)     URL="$2"; shift 2 ;;
-        -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --model)   MODEL="$2"; shift 2 ;;
+        -h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) err "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -118,6 +126,7 @@ import urllib.request
 BASE, MAX_TOKENS, RUNS, PROMPT_FILE = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
 MODE = sys.argv[5] if len(sys.argv) > 5 else "single"
 PAD = int(sys.argv[6]) if len(sys.argv) > 6 else 8
+MODEL = sys.argv[7] if len(sys.argv) > 7 else "local"
 
 base = open(PROMPT_FILE).read().strip()
 TURN2 = "Now list exactly three practical ways a compiler can improve cache behaviour."
@@ -125,14 +134,20 @@ TURN2 = "Now list exactly three practical ways a compiler can improve cache beha
 
 def post(messages, max_tokens):
     body = {
-        "model": "local",
+        "model": MODEL,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "stream": False,
-        # off on both backends so the two measure the same work; a thinking model burns
-        # most of its time on reasoning tokens and that is a sampling choice, not a
-        # hardware measurement
+        # Off on both backends so the two measure the same work; a thinking model burns
+        # most of its time on reasoning tokens, and that is a sampling choice rather
+        # than a hardware measurement. The two servers name this differently, so send
+        # both spellings and let each take the one it knows:
+        #   llama-server     chat_template_kwargs.enable_thinking, thinking_budget_tokens
+        #   mlx-vlm server   enable_thinking, thinking_budget
+        # Both ignore fields they do not define, so the extra keys are harmless.
+        "enable_thinking": False,
+        "thinking_budget": 0,
         "thinking_budget_tokens": 0,
         "chat_template_kwargs": {"enable_thinking": False},
     }
@@ -214,7 +229,7 @@ measure_url() {
     _mu_label="${2:-llama.cpp}"
 
     write_client
-    R=$(python3 "$TMP/client.py" "$_mu_base" "$MAX_TOKENS" "$RUNS" "$TMP/base_prompt.txt" single 2>"$TMP/run.log")
+    R=$(python3 "$TMP/client.py" "$_mu_base" "$MAX_TOKENS" "$RUNS" "$TMP/base_prompt.txt" single 8 "$MODEL" 2>"$TMP/run.log")
     cat "$TMP/run.log" >&2
     if [ -z "$R" ]; then
         err "no result from $_mu_base; see the run log above"
@@ -226,7 +241,7 @@ measure_url() {
     printf "  %-22s %10s %10s\n" "----------------------" "----------" "----------"
     printf "  %-22s %10s %10s\n" "$_mu_label" "$R_GEN" "$R_PRE"
 
-    F=$(python3 "$TMP/client.py" "$_mu_base" "$MAX_TOKENS" 1 "$TMP/base_prompt.txt" followup "$PAD" 2>/dev/null)
+    F=$(python3 "$TMP/client.py" "$_mu_base" "$MAX_TOKENS" 1 "$TMP/base_prompt.txt" followup "$PAD" "$MODEL" 2>/dev/null)
     if [ -n "$F" ]; then
         F_SECS=$(echo "$F" | cut -d' ' -f1)
         F_TOK=$(echo "$F" | cut -d' ' -f2)
